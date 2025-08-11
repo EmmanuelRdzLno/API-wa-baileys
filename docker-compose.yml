@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  whatsapp-bot:
+    build: .
+    container_name: whatsapp-bot
+    restart: unless-stopped
+    volumes:
+      - ./auth:/app/auth
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+    secrets:
+      - gcp-credentials
+
+secrets:
+  gcp-credentials:
+    file: ./credentials.json

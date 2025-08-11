@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WhatsApp Bot Status</title>
+</head>
+<body>
+  <h1>Estado: <span id="status">Cargando...</span></h1>
+  <div id="qr-container" style="display: none;">
+    <h3>Escanea el QR para conectar:</h3>
+    <img id="qr" src="">
+  </div>
+  <h2>Últimos mensajes</h2>
+  <ul id="messages"></ul>
+  <ul id="respuesta"></ul>
+  <script>
+    async function loadStatus() {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      document.getElementById('status').innerText = data.connected ? 'Conectado' : 'Desconectado';
+      if (!data.connected) {
+        const qrRes = await fetch('/api/qr');
+        if (qrRes.ok) {
+          const { qr } = await qrRes.json();
+          document.getElementById('qr').src = qr;
+          document.getElementById('qr-container').style.display = 'block';
+        }
+      } else {
+        document.getElementById('qr-container').style.display = 'none';
+      }
+    }
+
+    async function loadMessages() {
+      const res = await fetch('/api/messages');
+      const data = await res.json();
+      const ul = document.getElementById('messages');
+      ul.innerHTML = '';
+      data.forEach(m => {
+        const li = document.createElement('li');
+        li.textContent = `[${m.timestamp}] (${m.type}) ${m.from}: ${m.text}`;
+        ul.appendChild(li);
+      });
+    }
+
+    async function loadRespuesta() {
+      const res = await fetch('/api/respuesta');
+      const data = await res.json();
+      const ul = document.getElementById('respuesta');
+      ul.innerHTML = '';
+      data.forEach(m => {
+        const li = document.createElement('li');
+        li.textContent = `[${m.timestamp}] (${m.type}) ${m.from}: ${m.text}`;
+        ul.appendChild(li);
+      });
+    }
+
+    loadStatus();
+    loadMessages();
+    loadRespuesta();
+    setInterval(loadStatus, 5000);
+    setInterval(loadMessages, 10000);
+  </script>
+</body>
+</html>
