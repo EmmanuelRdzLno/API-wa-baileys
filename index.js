@@ -197,7 +197,7 @@ async function startSock() {
 
       try {
         if (fileBuffer) {
-          await sock.sendMessage(from, { text: 'Hola, mandaste el siguiente documento...' });
+          await sock.sendMessage(from, { text: 'Mandaste un documento, dame unos segundos para analisarlo...' });
 
           if (type === 'imageMessage') {
             await sock.sendMessage(from, { image: fileBuffer });
@@ -209,13 +209,28 @@ async function startSock() {
             await sock.sendMessage(from, { document: fileBuffer, mimetype, filename });
           }
 
-          await axios.post('http://localhost:4000/webhook/orquestador', fileBuffer, {
+          const data = await axios.post('http://localhost:4000/webhook/orquestador', fileBuffer, {
             headers: {
               'Content-Type': mimetype,
               'X-Filename': filename,
               'X-From': from
             }
-          });
+          }).then(res => res.data);
+
+          if (data.status === 'ok' && data.respuesta && data.respuesta.Content) {
+            const buffer = Buffer.from(data.respuesta.Content, 'base64');
+            const mimetype = data.respuesta.ContentType || 'application/octet-stream';
+            const filename = `factura.${mimetype.split('/')[1] || 'pdf'}`;
+
+            await sock.sendMessage(from, {
+              document: buffer,
+              mimetype,
+              filename,
+            });
+          } else {
+            const textoRespuesta = typeof data.respuesta === 'string' ? data.respuesta : JSON.stringify(data.respuesta);
+            await sock.sendMessage(from, { text: textoRespuesta });
+          }
 
         } else {
           // Enviar texto o documento según respuesta
