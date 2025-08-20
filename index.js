@@ -209,7 +209,7 @@ async function startSock() {
             await sock.sendMessage(from, { document: fileBuffer, mimetype, filename });
           }
 
-          const data = await axios.post('http://localhost:4000/webhook/orquestador', fileBuffer, {
+          const data = await axios.post('https://orquestador-577166035685.us-central1.run.app/webhook/orquestador', fileBuffer, {
             headers: {
               'Content-Type': mimetype,
               'X-Filename': filename,
@@ -235,7 +235,7 @@ async function startSock() {
         } else {
           // Enviar texto o documento según respuesta
           const data = await axios.post(
-            'http://localhost:4000/webhook/orquestador',
+            'https://orquestador-577166035685.us-central1.run.app/webhook/orquestador',
             text,
             {
               headers: {
