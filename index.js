@@ -176,11 +176,11 @@ async function startSock() {
       let filename = null;
       let mimetype = null;
 
-      // Extraer texto según tipo
+      // Extraer texto/archivo
       if (type === 'conversation') {
         text = content || '[Texto vacío]';
       } else if (type === 'extendedTextMessage') {
-        text = content.text || content?.extendedTextMessage?.text || '[Texto vacío]';
+        text = content.text || '[Texto vacío]';
       } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
         const stream = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
         fileBuffer = stream;
@@ -197,45 +197,20 @@ async function startSock() {
 
       try {
         if (fileBuffer) {
-          await sock.sendMessage(from, { text: 'Mandaste un documento, dame unos segundos para analisarlo...' });
-
-          if (type === 'imageMessage') {
-            await sock.sendMessage(from, { image: fileBuffer });
-          }
-          if (type === 'audioMessage') {
-            await sock.sendMessage(from, { audio: fileBuffer, mimetype });
-          }
-          if (type === 'documentMessage') {
-            await sock.sendMessage(from, { document: fileBuffer, mimetype, filename });
-          }
-
-          const data = await axios.post('https://orquestador-577166035685.us-central1.run.app/webhook/orquestador', fileBuffer, {
-            headers: {
-              'Content-Type': mimetype,
-              'X-Filename': filename,
-              'X-From': from
+          await axios.post(
+            'http://localhost:4000/webhook/orquestador',
+            fileBuffer,
+            {
+              headers: {
+                'Content-Type': mimetype,
+                'X-Filename': filename,
+                'X-From': from
+              }
             }
-          }).then(res => res.data);
-
-          if (data.status === 'ok' && data.respuesta && data.respuesta.Content) {
-            const buffer = Buffer.from(data.respuesta.Content, 'base64');
-            const mimetype = data.respuesta.ContentType || 'application/octet-stream';
-            const filename = `factura.${mimetype.split('/')[1] || 'pdf'}`;
-
-            await sock.sendMessage(from, {
-              document: buffer,
-              mimetype,
-              filename,
-            });
-          } else {
-            const textoRespuesta = typeof data.respuesta === 'string' ? data.respuesta : JSON.stringify(data.respuesta);
-            await sock.sendMessage(from, { text: textoRespuesta });
-          }
-
+          );
         } else {
-          // Enviar texto o documento según respuesta
-          const data = await axios.post(
-            'https://orquestador-577166035685.us-central1.run.app/webhook/orquestador',
+          await axios.post(
+            'http://localhost:4000/webhook/orquestador',
             text,
             {
               headers: {
@@ -243,26 +218,10 @@ async function startSock() {
                 'X-From': from
               }
             }
-          ).then(res => res.data);
-
-          if (data.status === 'ok' && data.respuesta && data.respuesta.Content) {
-            const buffer = Buffer.from(data.respuesta.Content, 'base64');
-            const mimetype = data.respuesta.ContentType || 'application/octet-stream';
-            const filename = `factura.${mimetype.split('/')[1] || 'pdf'}`;
-
-            await sock.sendMessage(from, {
-              document: buffer,
-              mimetype,
-              filename,
-            });
-          } else {
-            const textoRespuesta = typeof data.respuesta === 'string' ? data.respuesta : JSON.stringify(data.respuesta);
-            await sock.sendMessage(from, { text: textoRespuesta });
-          }
+          );
         }
-
       } catch (err) {
-        console.error('Error enviando al procesador:', err.message);
+        console.error('Error enviando al orquestador:', err.message);
       }
     }
   });
