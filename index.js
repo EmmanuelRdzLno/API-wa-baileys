@@ -65,6 +65,36 @@ app.get('/api/qr', (req, res) => {
   }
 });
 
+// ⬇️ agregar cerca de los otros endpoints
+app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
+  const to = req.headers['x-to'];
+  const { text, buttons } = req.body || {};
+
+  if (!to || !text || !Array.isArray(buttons) || buttons.length === 0) {
+    return res.status(400).json({ error: 'Faltan parámetros: to, text, buttons[]' });
+  }
+
+  try {
+    // Mapeo a formato Baileys "buttons"
+    const mapped = buttons.map(b => ({
+      buttonId: b.id,                         // p.ej. "CONFIRMAR" ó "CANCELAR"
+      buttonText: { displayText: b.text },    // p.ej. "ACEPTAR" ó "CANCELAR"
+      type: 1
+    }));
+
+    await sock.sendMessage(to, {
+      text,
+      buttons: mapped,
+      headerType: 1
+    });
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error('Error enviando botones:', e.message);
+    res.sendStatus(500);
+  }
+});
+
 // Enviar respuesta procesada (texto, imagen, documento)
 app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
   const tipo = req.headers['content-type'];
