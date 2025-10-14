@@ -211,6 +211,14 @@ async function startSock() {
         text = content || '[Texto vacío]';
       } else if (type === 'extendedTextMessage') {
         text = content.text || '[Texto vacío]';
+      } if (type === 'buttonsResponseMessage') {
+        // prioriza el id interno (CONFIRMAR/CANCELAR) para que el orquestador lo procese tal cual
+        const id = content.selectedButtonId;
+        const label = content.selectedDisplayText;
+        text = id || label || '';
+
+      // opcional: establece un fallback
+        if (!text) text = 'CONFIRMAR';
       } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
         const stream = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
         fileBuffer = stream;
