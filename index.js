@@ -211,7 +211,7 @@ async function startSock() {
         text = content || '[Texto vacío]';
       } else if (type === 'extendedTextMessage') {
         text = content.text || '[Texto vacío]';
-      } if (type === 'buttonsResponseMessage') {
+      } else if (type === 'buttonsResponseMessage') {
         // prioriza el id interno (CONFIRMAR/CANCELAR) para que el orquestador lo procese tal cual
         const id = content.selectedButtonId;
         const label = content.selectedDisplayText;
