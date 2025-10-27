@@ -194,7 +194,13 @@ async function startSock() {
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) return;
+      // IGNORAR ESTADOS DE WHATSAPP
+      if (msg.key.remoteJid === 'status@broadcast') continue;
+
+      // NO deseas mensajes de grupos
+      if (msg.key.remoteJid.endsWith('@g.us')) continue;
+
+      if (!msg.message || msg.key.fromMe) continue;
 
       const from = msg.key.remoteJid;
       const type = Object.keys(msg.message)[0];
