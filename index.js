@@ -116,7 +116,9 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
   }
 });
 
-const port = process.env.WEB_PORT || 3000;
+const WEB_PORT = process.env.WEB_PORT || 3000;
+const WEB_HOST = process.env.WEB_HOST || 'localhost';
+const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 3000;
 let sock; // declarado fuera para reusar entre reconexiones
 
 async function startSock() {
@@ -242,7 +244,7 @@ async function startSock() {
       try {
         if (fileBuffer) {
           await axios.post(
-            'http://localhost:4000/webhook/orquestador',
+            `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             fileBuffer,
             {
               headers: {
@@ -254,7 +256,7 @@ async function startSock() {
           );
         } else {
           await axios.post(
-            'http://localhost:4000/webhook/orquestador',
+            `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             text,
             {
               headers: {
@@ -281,8 +283,8 @@ function broadcastStatus() {
   });
 }
 
-app.listen(port, () => {
-  console.log(`🌐 Web UI disponible en http://localhost:${port}/web`);
+app.listen(WEB_PORT, () => {
+  console.log(`🌐 Web UI disponible en http://${WEB_HOST}:${WEB_PORT}/web`);
 });
 
 startSock();
