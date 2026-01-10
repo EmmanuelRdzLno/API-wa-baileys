@@ -146,9 +146,10 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
   }
 });
 
-// ==========================
-// WhatsApp Socket
-// ==========================
+const WEB_PORT = process.env.WEB_PORT || 3000;
+const WEB_HOST = process.env.WEB_HOST || 'localhost';
+const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000';
+
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('auth');
   const { version } = await fetchLatestBaileysVersion();
@@ -243,7 +244,7 @@ async function startSock() {
       try {
         if (fileBuffer) {
           await axios.post(
-            'http://localhost:4000/webhook/orquestador',
+            `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             fileBuffer,
             {
               headers: {
@@ -256,7 +257,7 @@ async function startSock() {
           );
         } else {
           await axios.post(
-            'http://localhost:4000/webhook/orquestador',
+            `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             text,
             {
               headers: {
@@ -284,8 +285,8 @@ function broadcastStatus() {
 
 const port = process.env.WEB_PORT || 3000;
 
-app.listen(port, () => {
-  console.log(`🌐 Web UI disponible en http://localhost:${port}/web`);
+app.listen(WEB_PORT, () => {
+  console.log(`🌐 Web UI disponible en http://${WEB_HOST}:${WEB_PORT}/web`);
 });
 
 startSock();
