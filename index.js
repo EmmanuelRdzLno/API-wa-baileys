@@ -1,4 +1,12 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage,
+  jidDecode
+} = require('@whiskeysockets/baileys');
+
 const qrcodeTerminal = require('qrcode-terminal');
 const qrcode = require('qrcode');
 const fs = require('fs');
@@ -8,7 +16,9 @@ const express = require('express');
 const expressWs = require('express-ws');
 const basicAuth = require('basic-auth');
 const path = require('path');
+const axios = require('axios');
 
+let wasEverConnected = false;
 let currentQR = null;
 let desconectadoDesde = null;
 let reconexionIntentos = 0;
@@ -18,13 +28,33 @@ const ALERTA_ENVIADA = { estado: false };
 let isConnected = false;
 const delay = ms => new Promise(res => setTimeout(res, ms));
 const conversaciones = new Map();
-const axios = require('axios');
 
 const app = express();
-const wsInstance = expressWs(app); // ← Aquí guardamos el servidor WS
-const wss = wsInstance.getWss();   // ← Obtenemos el WebSocketServer
+const wsInstance = expressWs(app);
+const wss = wsInstance.getWss();
 
+let lastMessages = [];
+let sock;
+
+// ==========================
+// 🔹 NUEVAS FUNCIONES (LID)
+// ==========================
+function normalizeJid(jid) {
+  if (!jid) return null;
+  return jid.split(':')[0]; // elimina device-id
+}
+
+function extractPhone(jid) {
+  if (!jid) return null;
+  if (jid.endsWith('@s.whatsapp.net')) {
+    return jid.replace('@s.whatsapp.net', '');
+  }
+  return null; // LID no tiene teléfono
+}
+
+// ==========================
 // Autenticación básica
+// ==========================
 const auth = (req, res, next) => {
   const user = basicAuth(req);
   const validUser = process.env.WEB_USER || 'admin';
@@ -37,26 +67,23 @@ const auth = (req, res, next) => {
   next();
 };
 
-// Web UI protegida
+// ==========================
+// Web UI
+// ==========================
 app.use('/web', auth, express.static(path.join(__dirname, 'web')));
 
-// API REST
 app.get('/api/status', auth, (req, res) => {
   res.json({ connected: isConnected });
 });
-
-let lastMessages = [];
 
 app.get('/api/messages', auth, (req, res) => {
   res.json(lastMessages.slice(-20));
 });
 
-// WebSocket tiempo real
 app.ws('/ws/status', function (ws, req) {
   ws.send(JSON.stringify({ connected: isConnected }));
 });
 
-// QR para escanear desde frontend
 app.get('/api/qr', (req, res) => {
   if (currentQR) {
     res.json({ qr: currentQR });
@@ -65,7 +92,9 @@ app.get('/api/qr', (req, res) => {
   }
 });
 
-// ⬇️ agregar cerca de los otros endpoints
+// ==========================
+// Envío de botones
+// ==========================
 app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
   const to = req.headers['x-to'];
   const { text, buttons } = req.body || {};
@@ -75,10 +104,9 @@ app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
   }
 
   try {
-    // Mapeo a formato Baileys "buttons"
     const mapped = buttons.map(b => ({
-      buttonId: b.id,                         // p.ej. "CONFIRMAR" ó "CANCELAR"
-      buttonText: { displayText: b.text },    // p.ej. "ACEPTAR" ó "CANCELAR"
+      buttonId: b.id,
+      buttonText: { displayText: b.text },
       type: 1
     }));
 
@@ -95,7 +123,9 @@ app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
   }
 });
 
-// Enviar respuesta procesada (texto, imagen, documento)
+// ==========================
+// Respuesta del orquestador
+// ==========================
 app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
   const tipo = req.headers['content-type'];
   const to = req.headers['x-to'];
@@ -116,9 +146,9 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
   }
 });
 
-const port = process.env.WEB_PORT || 3000;
-let sock; // declarado fuera para reusar entre reconexiones
-
+// ==========================
+// WhatsApp Socket
+// ==========================
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('auth');
   const { version } = await fetchLatestBaileysVersion();
@@ -126,67 +156,49 @@ async function startSock() {
   sock = makeWASocket({
     version,
     logger: P({ level: 'silent' }),
-    auth: state
+    auth: state,
+    printQRInTerminal: true
   });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
     if (qr) {
-      qrcodeTerminal.generate(qr, { small: true });
       currentQR = await qrcode.toDataURL(qr);
-    }
-
-    if (connection === 'close') {
-      isConnected = false;
-      broadcastStatus(); // enviar estado a los sockets web
-
-      const reasonCode = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = reasonCode === DisconnectReason.loggedOut;
-
-      desconectadoDesde = Date.now();
-      reconexionIntentos++;
-
-        if (isLoggedOut) {
-            console.log('🔁 Usuario deslogueado. Cerrando socket y borrando credenciales...');
-
-            try {
-                await sock.logout(); // asegúrate de cerrar sesión correctamente
-            } catch (e) {
-                console.warn('⚠️ Error al cerrar sesión:', e.message);
-            }
-
-            // Esperar un poco para asegurarse que ya no esté en uso
-            setTimeout(() => {
-                try {
-                fs.rmSync('auth', { recursive: true, force: true });
-                console.log('🗑️ Carpeta de credenciales eliminada.');
-                } catch (err) {
-                console.error('❌ No se pudo eliminar la carpeta auth:', err.message);
-                }
-            }, 2000); // espera 2 segundos
-        }
-
-      if (reconexionIntentos >= MAX_REINTENTOS && !ALERTA_ENVIADA.estado) {
-        await enviarAlerta(
-          '🚨 Error de conexión WhatsApp Bot',
-          'No se pudo reconectar después de varios intentos. Requiere atención manual.'
-        );
-        ALERTA_ENVIADA.estado = true;
-      }
-
-      console.log(`🔄 Reintentando conexión en ${RETRY_DELAY_MS / 1000} segundos...`);
-      setTimeout(() => startSock(), RETRY_DELAY_MS);
+      qrcodeTerminal.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
       isConnected = true;
-      broadcastStatus(); // enviar estado a los sockets web
-
-      console.log('✅ Conectado a WhatsApp');
-      desconectadoDesde = null;
+      wasEverConnected = true; // 🔥 CLAVE
       reconexionIntentos = 0;
       ALERTA_ENVIADA.estado = false;
+      broadcastStatus();
+      console.log('✅ Conectado a WhatsApp');
+    }
+
+    if (connection === 'close') {
+      isConnected = false;
+      broadcastStatus();
+
+      const reasonCode = lastDisconnect?.error?.output?.statusCode;
+      const isLoggedOut = reasonCode === DisconnectReason.loggedOut;
+
+      if (isLoggedOut) {
+        console.log('⚠️ Logout recibido');
+
+        // 🔥 SOLO limpiar auth si ya hubo una conexión estable previa
+        if (wasEverConnected) {
+          console.log('🗑️ Logout real, limpiando auth...');
+          fs.rmSync('auth', { recursive: true, force: true });
+          wasEverConnected = false;
+        } else {
+          console.log('⏳ Logout durante login inicial, NO se borra auth');
+        }
+      }
+
+      reconexionIntentos++;
+      setTimeout(startSock, RETRY_DELAY_MS);
     }
   });
 
@@ -194,15 +206,13 @@ async function startSock() {
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      // IGNORAR ESTADOS DE WHATSAPP
+      if (!msg.message || msg.key.fromMe) continue;
       if (msg.key.remoteJid === 'status@broadcast') continue;
-
-      // NO deseas mensajes de grupos
       if (msg.key.remoteJid.endsWith('@g.us')) continue;
 
-      if (!msg.message || msg.key.fromMe) continue;
+      const rawJid = normalizeJid(msg.key.remoteJid);
+      const phone = extractPhone(rawJid);
 
-      const from = msg.key.remoteJid;
       const type = Object.keys(msg.message)[0];
       const content = msg.message[type];
       const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toLocaleString();
@@ -212,22 +222,14 @@ async function startSock() {
       let filename = null;
       let mimetype = null;
 
-      // Extraer texto/archivo
       if (type === 'conversation') {
-        text = content || '[Texto vacío]';
+        text = content;
       } else if (type === 'extendedTextMessage') {
-        text = content.text || '[Texto vacío]';
+        text = content.text;
       } else if (type === 'buttonsResponseMessage') {
-        // prioriza el id interno (CONFIRMAR/CANCELAR) para que el orquestador lo procese tal cual
-        const id = content.selectedButtonId;
-        const label = content.selectedDisplayText;
-        text = id || label || '';
-
-      // opcional: establece un fallback
-        if (!text) text = 'CONFIRMAR';
+        text = content.selectedButtonId || content.selectedDisplayText || 'CONFIRMAR';
       } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
-        const stream = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
-        fileBuffer = stream;
+        fileBuffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
         filename = content.fileName || `${type}-${Date.now()}`;
         mimetype = content.mimetype;
         text = `[${type}] recibido`;
@@ -235,8 +237,7 @@ async function startSock() {
         text = `[${type}] no soportado`;
       }
 
-      // Guardar últimos mensajes
-      lastMessages.unshift({ from, text, timestamp });
+      lastMessages.unshift({ from: rawJid, text, timestamp });
       lastMessages = lastMessages.slice(0, 20);
 
       try {
@@ -248,7 +249,8 @@ async function startSock() {
               headers: {
                 'Content-Type': mimetype,
                 'X-Filename': filename,
-                'X-From': from
+                'X-From': rawJid,
+                'X-Phone': phone || ''
               }
             }
           );
@@ -259,7 +261,8 @@ async function startSock() {
             {
               headers: {
                 'Content-Type': 'text/plain',
-                'X-From': from
+                'X-From': rawJid,
+                'X-Phone': phone || ''
               }
             }
           );
@@ -271,15 +274,15 @@ async function startSock() {
   });
 }
 
-// Función para emitir estado a todos los clientes WebSocket conectados
+// ==========================
 function broadcastStatus() {
   const msg = JSON.stringify({ connected: isConnected });
   wss.clients.forEach(client => {
-    try {
-      client.send(msg);
-    } catch (e) {}
+    try { client.send(msg); } catch (e) {}
   });
 }
+
+const port = process.env.WEB_PORT || 3000;
 
 app.listen(port, () => {
   console.log(`🌐 Web UI disponible en http://localhost:${port}/web`);
