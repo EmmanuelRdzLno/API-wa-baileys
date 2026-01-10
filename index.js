@@ -118,7 +118,7 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
 
 const WEB_PORT = process.env.WEB_PORT || 3000;
 const WEB_HOST = process.env.WEB_HOST || 'localhost';
-const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 3000;
+const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000';
 let sock; // declarado fuera para reusar entre reconexiones
 
 async function startSock() {
