@@ -1,6 +1,7 @@
 {
   "name": "api-whatsapp-beileys",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -13,7 +14,7 @@
   "description": "",
   "dependencies": {
     "@google-cloud/secret-manager": "^6.1.0",
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.11.0",
     "basic-auth": "^2.0.1",
     "dotenv": "^17.2.1",

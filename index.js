@@ -1,59 +1,128 @@
-const {
+// ==========================
+// Forzar IPv4
+// ==========================
+import dns from 'dns';
+dns.setDefaultResultOrder('ipv4first');
+
+import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  downloadMediaMessage,
-  jidDecode
-} = require('@whiskeysockets/baileys');
+  downloadMediaMessage
+} from '@whiskeysockets/baileys';
 
-const qrcodeTerminal = require('qrcode-terminal');
-const qrcode = require('qrcode');
-const fs = require('fs');
-const P = require('pino');
-const { enviarAlerta } = require('./mailer');
-const express = require('express');
-const expressWs = require('express-ws');
-const basicAuth = require('basic-auth');
-const path = require('path');
-const axios = require('axios');
+import qrcodeTerminal from 'qrcode-terminal';
+import qrcode from 'qrcode';
+import fs from 'fs';
+import P from 'pino';
 
+import express from 'express';
+import expressWs from 'express-ws';
+import basicAuth from 'basic-auth';
+import path from 'path';
+import axios from 'axios';
+
+import { fileURLToPath } from 'url';
+
+// Ajuste para __dirname en ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Si tu mailer.js es CommonJS, aquí lo importamos dinámico para no romper
+let enviarAlerta = async () => {};
+try {
+  const mailer = await import('./mailer.js');
+  enviarAlerta = mailer.enviarAlerta || enviarAlerta;
+} catch {}
+
+// ==========================
+// Estado
+// ==========================
 let wasEverConnected = false;
 let currentQR = null;
-let desconectadoDesde = null;
 let reconexionIntentos = 0;
 const MAX_REINTENTOS = 5;
 const RETRY_DELAY_MS = 5000;
 const ALERTA_ENVIADA = { estado: false };
 let isConnected = false;
-const delay = ms => new Promise(res => setTimeout(res, ms));
-const conversaciones = new Map();
+
+let lastMessages = [];
+let sock;
 
 const app = express();
 const wsInstance = expressWs(app);
 const wss = wsInstance.getWss();
 
-let lastMessages = [];
-let sock;
+const WEB_PORT = process.env.WEB_PORT || 3000;
+const WEB_HOST = process.env.WEB_HOST || 'localhost';
+const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000';
 
 // ==========================
-// 🔹 NUEVAS FUNCIONES (LID)
+// Helpers
 // ==========================
 function normalizeJid(jid) {
   if (!jid) return null;
-  return jid.split(':')[0]; // elimina device-id
+  return jid.split(':')[0];
 }
 
 function extractPhone(jid) {
   if (!jid) return null;
-  if (jid.endsWith('@s.whatsapp.net')) {
-    return jid.replace('@s.whatsapp.net', '');
+  if (jid.endsWith('@s.whatsapp.net')) return jid.replace('@s.whatsapp.net', '');
+  return null;
+}
+
+function unwrapMessage(message) {
+  if (!message) return null;
+  if (message.ephemeralMessage?.message) return message.ephemeralMessage.message;
+  if (message.viewOnceMessage?.message) return message.viewOnceMessage.message;
+  if (message.viewOnceMessageV2?.message) return message.viewOnceMessageV2.message;
+  return message;
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout (${ms}ms) en ${label}`)), ms)
+    ),
+  ]);
+}
+
+async function retry(fn, retries = 1, label = 'retry') {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      console.warn(`⚠️ ${label} intento ${i + 1}/${retries + 1} falló:`, e?.message || e);
+    }
   }
-  return null; // LID no tiene teléfono
+  throw lastErr;
+}
+
+function oeHexToDate(oeHex) {
+  const seconds = parseInt(oeHex, 16);
+  if (Number.isNaN(seconds)) return null;
+  return new Date(seconds * 1000);
+}
+
+function isUrlExpired(url) {
+  try {
+    const u = new URL(url);
+    const oe = u.searchParams.get('oe');
+    if (!oe) return false;
+    const d = oeHexToDate(oe);
+    if (!d) return false;
+    return d.getTime() < Date.now();
+  } catch {
+    return false;
+  }
 }
 
 // ==========================
-// Autenticación básica
+// Basic Auth
 // ==========================
 const auth = (req, res, next) => {
   const user = basicAuth(req);
@@ -80,20 +149,17 @@ app.get('/api/messages', auth, (req, res) => {
   res.json(lastMessages.slice(-20));
 });
 
-app.ws('/ws/status', function (ws, req) {
+app.ws('/ws/status', function (ws) {
   ws.send(JSON.stringify({ connected: isConnected }));
 });
 
 app.get('/api/qr', (req, res) => {
-  if (currentQR) {
-    res.json({ qr: currentQR });
-  } else {
-    res.status(404).send('No QR disponible');
-  }
+  if (currentQR) res.json({ qr: currentQR });
+  else res.status(404).send('No QR disponible');
 });
 
 // ==========================
-// Envío de botones
+// Botones
 // ==========================
 app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
   const to = req.headers['x-to'];
@@ -110,12 +176,7 @@ app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
       type: 1
     }));
 
-    await sock.sendMessage(to, {
-      text,
-      buttons: mapped,
-      headerType: 1
-    });
-
+    await sock.sendMessage(to, { text, buttons: mapped, headerType: 1 });
     res.sendStatus(200);
   } catch (e) {
     console.error('Error enviando botones:', e.message);
@@ -124,7 +185,7 @@ app.post('/api/botones', express.json({ limit: '1mb' }), async (req, res) => {
 });
 
 // ==========================
-// Respuesta del orquestador
+// Orquestador -> WhatsApp
 // ==========================
 app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
   const tipo = req.headers['content-type'];
@@ -132,12 +193,12 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
   const filename = req.headers['x-filename'] || 'archivo';
 
   try {
-    if (tipo.startsWith('text/')) {
+    if (tipo?.startsWith('text/')) {
       await sock.sendMessage(to, { text: req.body.toString() });
-    } else if (tipo.startsWith('image/')) {
+    } else if (tipo?.startsWith('image/')) {
       await sock.sendMessage(to, { image: req.body, mimetype: tipo, caption: 'Procesado' });
-    } else if (tipo.startsWith('application/')) {
-      await sock.sendMessage(to, { document: req.body, mimetype: tipo, fileName: filename });
+    } else {
+      await sock.sendMessage(to, { document: req.body, mimetype: tipo || 'application/octet-stream', fileName: filename });
     }
     res.sendStatus(200);
   } catch (e) {
@@ -146,10 +207,16 @@ app.post('/api/respuesta', express.raw({ type: '*/*', limit: '25mb' }), async (r
   }
 });
 
-const WEB_PORT = process.env.WEB_PORT || 3000;
-const WEB_HOST = process.env.WEB_HOST || 'localhost';
-const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000';
+function broadcastStatus() {
+  const msg = JSON.stringify({ connected: isConnected });
+  wss.clients.forEach(client => {
+    try { client.send(msg); } catch {}
+  });
+}
 
+// ==========================
+// Baileys
+// ==========================
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('auth');
   const { version } = await fetchLatestBaileysVersion();
@@ -161,6 +228,8 @@ async function startSock() {
     printQRInTerminal: true
   });
 
+  console.log('updateMediaMessage:', typeof sock.updateMediaMessage);
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
@@ -171,7 +240,7 @@ async function startSock() {
 
     if (connection === 'open') {
       isConnected = true;
-      wasEverConnected = true; // 🔥 CLAVE
+      wasEverConnected = true;
       reconexionIntentos = 0;
       ALERTA_ENVIADA.estado = false;
       broadcastStatus();
@@ -187,18 +256,19 @@ async function startSock() {
 
       if (isLoggedOut) {
         console.log('⚠️ Logout recibido');
-
-        // 🔥 SOLO limpiar auth si ya hubo una conexión estable previa
         if (wasEverConnected) {
           console.log('🗑️ Logout real, limpiando auth...');
           fs.rmSync('auth', { recursive: true, force: true });
           wasEverConnected = false;
-        } else {
-          console.log('⏳ Logout durante login inicial, NO se borra auth');
         }
       }
 
       reconexionIntentos++;
+      if (reconexionIntentos > MAX_REINTENTOS) {
+        console.log('🛑 Max reintentos alcanzado');
+        return;
+      }
+
       setTimeout(startSock, RETRY_DELAY_MS);
     }
   });
@@ -207,43 +277,97 @@ async function startSock() {
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      if (msg.key.remoteJid === 'status@broadcast') continue;
-      if (msg.key.remoteJid.endsWith('@g.us')) continue;
-
-      const rawJid = normalizeJid(msg.key.remoteJid);
-      const phone = extractPhone(rawJid);
-
-      const type = Object.keys(msg.message)[0];
-      const content = msg.message[type];
-      const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toLocaleString();
-
-      let text = '';
-      let fileBuffer = null;
-      let filename = null;
-      let mimetype = null;
-
-      if (type === 'conversation') {
-        text = content;
-      } else if (type === 'extendedTextMessage') {
-        text = content.text;
-      } else if (type === 'buttonsResponseMessage') {
-        text = content.selectedButtonId || content.selectedDisplayText || 'CONFIRMAR';
-      } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
-        fileBuffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
-        filename = content.fileName || `${type}-${Date.now()}`;
-        mimetype = content.mimetype;
-        text = `[${type}] recibido`;
-      } else {
-        text = `[${type}] no soportado`;
-      }
-
-      lastMessages.unshift({ from: rawJid, text, timestamp });
-      lastMessages = lastMessages.slice(0, 20);
-
       try {
+        if (!msg.message || msg.key.fromMe) continue;
+        if (msg.key.remoteJid === 'status@broadcast') continue;
+        if (msg.key.remoteJid.endsWith('@g.us')) continue;
+
+        const rawJid = normalizeJid(msg.key.remoteJid);
+        const phone = extractPhone(rawJid);
+
+        const realMessage = unwrapMessage(msg.message);
+        if (!realMessage) continue;
+      
+        const type = Object.keys(realMessage)[0];
+        const content = realMessage[type];
+        // ✅ Texto que el usuario escribió junto al archivo (caption)
+        const captionRaw =
+          (content?.caption && String(content.caption)) ||
+          '';
+        // límite por seguridad (headers tienen límite)
+        const captionSafe = captionRaw.slice(0, 1500);
+
+        const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toLocaleString();
+
+        let text = '';
+        let fileBuffer = null;
+        let filename = null;
+        let mimetype = null;
+
+        if (type === 'conversation') {
+          text = content;
+        } else if (type === 'extendedTextMessage') {
+          text = content.text;
+        } else if (type === 'buttonsResponseMessage') {
+          text = content.selectedButtonId || content.selectedDisplayText || 'CONFIRMAR';
+        } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
+          console.log(`📥 Media recibido type=${type} from=${rawJid}`);
+          const mediaUrl = content?.url;
+          const expired = mediaUrl ? isUrlExpired(mediaUrl) : false;
+
+          if (expired) {
+            try {
+              const u = new URL(mediaUrl);
+              const oe = u.searchParams.get('oe');
+              console.log('⏱️ Media URL expirada oe=', oe, '=>', oeHexToDate(oe));
+            } catch {}
+          }
+
+          let msgToDownload = { ...msg, message: realMessage };
+
+          // refrescar si expirada / sin url
+          if (typeof sock.updateMediaMessage === 'function' && (expired || !mediaUrl)) {
+            console.log('🔄 updateMediaMessage (refresh)...');
+            const updated = await retry(
+              () => withTimeout(sock.updateMediaMessage(msgToDownload), 30000, 'updateMediaMessage'),
+              1,
+              'updateMediaMessage'
+            );
+            if (updated?.message) msgToDownload = { ...msgToDownload, message: updated.message };
+            console.log('✅ updateMediaMessage ok');
+          } else if (expired) {
+            throw new Error('Media expirado y no se pudo refrescar (updateMediaMessage no disponible)');
+          }
+
+          console.log('⬇️ downloadMediaMessage...');
+          fileBuffer = await withTimeout(
+            downloadMediaMessage(
+              msgToDownload,
+              'buffer',
+              {},
+              { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
+            ),
+            60000,
+            'downloadMediaMessage'
+          );
+
+          console.log('✅ download ok bytes=', fileBuffer?.length || 0);
+
+          filename = content.fileName || `${type}-${Date.now()}`;
+          mimetype = content.mimetype || 'application/octet-stream';
+          text = `[${type}] recibido`;
+        } else {
+          text = `[${type}] no soportado`;
+        }
+
+        lastMessages.unshift({ from: rawJid, text, timestamp });
+        lastMessages = lastMessages.slice(0, 20);
+
+        // enviar al orquestador
         if (fileBuffer) {
-          await axios.post(
+          console.log('🚀 Enviando archivo a orquestador...', { filename, mimetype });
+
+          const resp = await axios.post(
             `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             fileBuffer,
             {
@@ -251,12 +375,18 @@ async function startSock() {
                 'Content-Type': mimetype,
                 'X-Filename': filename,
                 'X-From': rawJid,
-                'X-Phone': phone || ''
-              }
+                'X-Phone': phone || '',
+                'X-Text': captionSafe
+              },
+              maxBodyLength: Infinity,
+              maxContentLength: Infinity,
+              timeout: 60000
             }
           );
+
+          console.log('✅ Orquestador respondió:', resp.status);
         } else {
-          await axios.post(
+          const resp = await axios.post(
             `${ORQUESTADOR_HTTP}/webhook/orquestador`,
             text,
             {
@@ -264,27 +394,33 @@ async function startSock() {
                 'Content-Type': 'text/plain',
                 'X-From': rawJid,
                 'X-Phone': phone || ''
-              }
+              },
+              timeout: 30000
             }
           );
+          console.log('✅ Orquestador respondió:', resp.status);
         }
+
       } catch (err) {
-        console.error('Error enviando al orquestador:', err.message);
+        const status = err?.response?.status;
+        const url = err?.config?.url;
+
+        if (status && url && url.includes('mmg.whatsapp.net')) {
+          console.error('❌ Error MEDIA WHATSAPP:', status, url);
+        } else if (status && url && url.includes(ORQUESTADOR_HTTP)) {
+          console.error('❌ Error ORQUESTADOR:', status, url);
+          console.error('   Body:', err?.response?.data);
+        } else {
+          console.error('❌ Error procesando mensaje:', err?.message || err);
+        }
       }
     }
   });
 }
 
 // ==========================
-function broadcastStatus() {
-  const msg = JSON.stringify({ connected: isConnected });
-  wss.clients.forEach(client => {
-    try { client.send(msg); } catch (e) {}
-  });
-}
-
-const port = process.env.WEB_PORT || 3000;
-
+// Start server
+// ==========================
 app.listen(WEB_PORT, () => {
   console.log(`🌐 Web UI disponible en http://${WEB_HOST}:${WEB_PORT}/web`);
 });
