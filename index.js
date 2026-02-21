@@ -61,6 +61,23 @@ const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000'
 // ==========================
 // Helpers
 // ==========================
+function resetAuthState(reason = 'loggedOut') {
+  console.log(`🧹 Reseteando auth por: ${reason}`);
+  try {
+    fs.rmSync('auth', { recursive: true, force: true });
+  } catch (e) {
+    console.warn('⚠️ No se pudo borrar auth:', e?.message || e);
+  }
+
+  // resetea estado para que el Web UI muestre QR
+  currentQR = null;
+  wasEverConnected = false;
+  isConnected = false;
+
+  // si quieres que SIEMPRE reintente después de logout
+  reconexionIntentos = 0;
+}
+
 function normalizeJid(jid) {
   if (!jid) return null;
   return jid.split(':')[0];
@@ -218,6 +235,8 @@ function broadcastStatus() {
 // Baileys
 // ==========================
 async function startSock() {
+  // Evita sockets duplicados
+  try { sock?.end?.(); } catch {}
   const { state, saveCreds } = await useMultiFileAuthState('auth');
   const { version } = await fetchLatestBaileysVersion();
 
@@ -255,14 +274,15 @@ async function startSock() {
       const isLoggedOut = reasonCode === DisconnectReason.loggedOut;
 
       if (isLoggedOut) {
-        console.log('⚠️ Logout recibido');
-        if (wasEverConnected) {
-          console.log('🗑️ Logout real, limpiando auth...');
-          fs.rmSync('auth', { recursive: true, force: true });
-          wasEverConnected = false;
-        }
+        console.log('⚠️ Logout recibido (loggedOut). Se borrará auth para forzar nuevo QR.');
+        resetAuthState('loggedOut');
+
+        // Espera un poco y vuelve a iniciar para generar QR
+        setTimeout(startSock, 1500);
+        return; // 👈 IMPORTANTE: corta aquí para no seguir el flujo normal
       }
 
+      // Para otros cierres (red, reinicio, timeout), reintenta con backoff normal
       reconexionIntentos++;
       if (reconexionIntentos > MAX_REINTENTOS) {
         console.log('🛑 Max reintentos alcanzado');
