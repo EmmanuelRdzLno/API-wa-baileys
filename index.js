@@ -297,18 +297,22 @@ async function startSock() {
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
+      // Hoisted para acceso en catch (fallback UX)
+      let rawJid = null;
+      let mediaType = null;
       try {
         if (!msg.message || msg.key.fromMe) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
         if (msg.key.remoteJid.endsWith('@g.us')) continue;
 
-        const rawJid = normalizeJid(msg.key.remoteJid);
+        rawJid = normalizeJid(msg.key.remoteJid);
         const phone = extractPhone(rawJid);
 
         const realMessage = unwrapMessage(msg.message);
         if (!realMessage) continue;
-      
+
         const type = Object.keys(realMessage)[0];
+        mediaType = type;
         const content = realMessage[type];
         // ✅ Texto que el usuario escribió junto al archivo (caption)
         const captionRaw =
@@ -331,35 +335,55 @@ async function startSock() {
         } else if (type === 'buttonsResponseMessage') {
           text = content.selectedButtonId || content.selectedDisplayText || 'CONFIRMAR';
         } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
-          console.log(`📥 Media recibido type=${type} from=${rawJid}`);
-          const mediaUrl = content?.url;
-          const expired = mediaUrl ? isUrlExpired(mediaUrl) : false;
+          const t0 = Date.now();
+          const mediaUrl   = content?.url;
+          const directPath = content?.directPath;
+          const mediaKey   = content?.mediaKey;
+          const expired    = mediaUrl ? isUrlExpired(mediaUrl) : false;
+          const msgAgeMs   = Date.now() - Number(msg.messageTimestamp) * 1000;
 
-          if (expired) {
-            try {
-              const u = new URL(mediaUrl);
-              const oe = u.searchParams.get('oe');
-              console.log('⏱️ Media URL expirada oe=', oe, '=>', oeHexToDate(oe));
-            } catch {}
-          }
+          console.log(`📥 media type=${type} from=${rawJid}`, {
+            url:        mediaUrl   ? 'present' : 'absent',
+            directPath: directPath ? 'present' : 'absent',
+            mediaKey:   mediaKey   ? 'present' : 'absent',
+            mimetype:   content?.mimetype,
+            expired,
+            msgAgeMs,
+          });
 
           let msgToDownload = { ...msg, message: realMessage };
 
-          // refrescar si expirada / sin url
-          if (typeof sock.updateMediaMessage === 'function' && (expired || !mediaUrl)) {
-            console.log('🔄 updateMediaMessage (refresh)...');
-            const updated = await retry(
-              () => withTimeout(sock.updateMediaMessage(msgToDownload), 30000, 'updateMediaMessage'),
-              1,
-              'updateMediaMessage'
-            );
-            if (updated?.message) msgToDownload = { ...msgToDownload, message: updated.message };
-            console.log('✅ updateMediaMessage ok');
+          // imageMessage desde galería: siempre refrescar URL antes de descargar.
+          // El CDN puede haber purgado el contenido antes de que expire el parámetro oe.
+          // Para otros tipos: solo refrescar si expirado o sin URL.
+          const shouldRefresh = typeof sock.updateMediaMessage === 'function'
+            && (type === 'imageMessage' || expired || !mediaUrl);
+
+          if (shouldRefresh) {
+            console.log(`🔄 updateMediaMessage type=${type} t=${Date.now() - t0}ms`);
+            const t1 = Date.now();
+            try {
+              const updated = await retry(
+                () => withTimeout(sock.updateMediaMessage(msgToDownload), 15000, 'updateMediaMessage'),
+                1,
+                'updateMediaMessage'
+              );
+              if (updated?.message) msgToDownload = { ...msgToDownload, message: updated.message };
+              console.log(`✅ updateMediaMessage ok dt=${Date.now() - t1}ms`);
+            } catch (updateErr) {
+              console.warn(`⚠️ updateMediaMessage falló dt=${Date.now() - t1}ms:`, updateErr?.message);
+              if (expired || !mediaUrl) {
+                // Sin URL válida y sin refresh → no hay forma de descargar
+                throw updateErr;
+              }
+              // URL presente pero refresh falló → intentar con URL original
+              console.warn('⚠️ Intentando descarga con URL original...');
+            }
           } else if (expired) {
-            throw new Error('Media expirado y no se pudo refrescar (updateMediaMessage no disponible)');
+            throw new Error('Media expirado y updateMediaMessage no disponible');
           }
 
-          console.log('⬇️ downloadMediaMessage...');
+          console.log(`⬇️ downloadMediaMessage dt_pre=${Date.now() - t0}ms`);
           fileBuffer = await withTimeout(
             downloadMediaMessage(
               msgToDownload,
@@ -367,11 +391,11 @@ async function startSock() {
               {},
               { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
             ),
-            60000,
+            45000,
             'downloadMediaMessage'
           );
 
-          console.log('✅ download ok bytes=', fileBuffer?.length || 0);
+          console.log(`✅ download ok bytes=${fileBuffer?.length ?? 0} dt_total=${Date.now() - t0}ms`);
 
           filename = content.fileName || `${type}-${Date.now()}`;
           mimetype = content.mimetype || 'application/octet-stream';
@@ -423,10 +447,23 @@ async function startSock() {
 
       } catch (err) {
         const status = err?.response?.status;
-        const url = err?.config?.url;
+        const url    = err?.config?.url;
+        const isMediaFail =
+          (status && url && url.includes('mmg.whatsapp.net')) ||
+          err?.message?.includes('Timeout') ||
+          err?.message?.includes('fetch stream') ||
+          err?.message?.includes('updateMediaMessage');
 
-        if (status && url && url.includes('mmg.whatsapp.net')) {
-          console.error('❌ Error MEDIA WHATSAPP:', status, url);
+        if (isMediaFail) {
+          console.error(`❌ Error descargando media type=${mediaType}:`, err?.message || err);
+          // Fallback UX: pedir al usuario que reenvíe como documento
+          if (rawJid && mediaType === 'imageMessage') {
+            try {
+              await sock.sendMessage(rawJid, {
+                text: '⚠️ No pude descargar tu imagen. Por favor reenvíala como *documento* (toca 📎 → Documento al adjuntar).'
+              });
+            } catch {}
+          }
         } else if (status && url && url.includes(ORQUESTADOR_HTTP)) {
           console.error('❌ Error ORQUESTADOR:', status, url);
           console.error('   Body:', err?.response?.data);
