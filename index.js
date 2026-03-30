@@ -1,3 +1,5 @@
+import 'dotenv/config';
+
 // ==========================
 // Forzar IPv4
 // ==========================
@@ -11,6 +13,8 @@ import {
   fetchLatestBaileysVersion,
   downloadMediaMessage
 } from '@whiskeysockets/baileys';
+
+import { buildMessageDedupeKey, wasMessageProcessed, markMessageProcessed } from './dedupe.js';
 
 import qrcodeTerminal from 'qrcode-terminal';
 import qrcode from 'qrcode';
@@ -59,12 +63,40 @@ const WEB_HOST = process.env.WEB_HOST || 'localhost';
 const ORQUESTADOR_HTTP = process.env.ORQUESTADOR_HTTP || 'http://localhost:4000';
 
 // ==========================
+// Config de ambiente Baileys
+// ==========================
+const BAILEYS_ENV      = process.env.BAILEYS_ENV      || 'local';
+const BAILEYS_AUTH_DIR = process.env.BAILEYS_AUTH_DIR  || `./auth/${BAILEYS_ENV}`;
+
+// Si true, Baileys no solicitará historial completo al reconectar
+const BAILEYS_DISABLE_HISTORY_SYNC = process.env.BAILEYS_DISABLE_HISTORY_SYNC === 'true';
+
+// Si true, filtra mensajes cuyo timestamp sea anterior al arranque de esta instancia
+const BAILEYS_IGNORE_STALE_SYNC_MESSAGES = process.env.BAILEYS_IGNORE_STALE_SYNC_MESSAGES === 'true';
+
+// Timestamp de arranque en segundos Unix (usado como referencia para stale filter)
+const BOOT_TS = Math.floor(Date.now() / 1000);
+
+// ==========================
+// Config de descarga de media
+// ==========================
+// Timeout para la llamada a updateMediaMessage (rehidratación de URL en WA servers)
+const BAILEYS_MEDIA_UPDATE_TIMEOUT_MS  = parseInt(process.env.BAILEYS_MEDIA_UPDATE_TIMEOUT_MS  || '20000');
+// Timeout para downloadMediaMessage (descarga efectiva del buffer)
+const BAILEYS_MEDIA_DOWNLOAD_TIMEOUT_MS = parseInt(process.env.BAILEYS_MEDIA_DOWNLOAD_TIMEOUT_MS || '60000');
+// Máximo de reintentos de descarga DESPUÉS de un refresh (0 = no reintentar)
+const BAILEYS_MEDIA_MAX_RETRIES = parseInt(process.env.BAILEYS_MEDIA_MAX_RETRIES || '1');
+
+console.log(`[BAILEYS] startup env=${BAILEYS_ENV} auth_dir=${BAILEYS_AUTH_DIR} history_sync_disabled=${BAILEYS_DISABLE_HISTORY_SYNC} ignore_stale=${BAILEYS_IGNORE_STALE_SYNC_MESSAGES} boot_ts=${BOOT_TS}`);
+
+// ==========================
 // Helpers
 // ==========================
 function resetAuthState(reason = 'loggedOut') {
   console.log(`🧹 Reseteando auth por: ${reason}`);
+  console.log(`[BAILEYS] auth_reset reason=${reason} dir=${BAILEYS_AUTH_DIR}`);
   try {
-    fs.rmSync('auth', { recursive: true, force: true });
+    fs.rmSync(BAILEYS_AUTH_DIR, { recursive: true, force: true });
   } catch (e) {
     console.warn('⚠️ No se pudo borrar auth:', e?.message || e);
   }
@@ -136,6 +168,154 @@ function isUrlExpired(url) {
   } catch {
     return false;
   }
+}
+
+// ==========================
+// Media download
+// ==========================
+
+/**
+ * Error semántico: el media no puede recuperarse de ninguna forma.
+ * Usado para distinguir "falla de red transitoria" de "WA server rechazó definitivamente".
+ */
+class MediaUnrecoverableError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'MediaUnrecoverableError';
+    this.cause = cause;
+  }
+}
+
+/**
+ * Detecta si el error es un rechazo definitivo del servidor WA
+ * (no un timeout ni error de red transitorio).
+ * "Failed to re-upload media (2)" = WA server rechazó el re-upload.
+ * No tiene sentido reintentar.
+ */
+function isWaServerRejection(err) {
+  const msg = err?.message || '';
+  return msg.includes('Failed to re-upload media') || msg.includes('re-upload');
+}
+
+/**
+ * Descarga robusta de media con dos fases:
+ *
+ * Para imageMessage (eager refresh):
+ *   1. updateMediaMessage primero (soft-fail)
+ *   2. downloadMediaMessage
+ *
+ * Para documentMessage/audioMessage/videoMessage (lazy refresh):
+ *   1. downloadMediaMessage directamente (reuploadRequest hook interno)
+ *   2. Si falla: updateMediaMessage explícito + reintento de descarga
+ *
+ * Si todos los intentos fallan → lanza MediaUnrecoverableError.
+ * NUNCA lanza antes de haber intentado al menos una descarga.
+ */
+async function downloadMediaRobust(sock, msg, realMessage, content, type) {
+  const t0    = Date.now();
+  const label = `[BAILEYS MEDIA] type=${type}`;
+
+  const mediaUrl   = content?.url;
+  const directPath = content?.directPath;
+  const mediaKey   = content?.mediaKey;
+  const expired    = mediaUrl ? isUrlExpired(mediaUrl) : false;
+  const msgAgeMs   = Date.now() - Number(msg.messageTimestamp) * 1000;
+
+  console.log(`${label} download_start`, {
+    url:        mediaUrl   ? 'present' : 'absent',
+    directPath: directPath ? 'present' : 'absent',
+    mediaKey:   mediaKey   ? 'present' : 'absent',
+    mimetype:   content?.mimetype,
+    expired,
+    msgAgeMs,
+  });
+
+  const canUpdate = typeof sock.updateMediaMessage === 'function';
+
+  let msgToDownload = { ...msg, message: realMessage };
+
+  // Helper: intento de descarga con timeout centralizado
+  const attemptDownload = (m) =>
+    withTimeout(
+      downloadMediaMessage(m, 'buffer', {}, {
+        logger:         sock.logger,
+        reuploadRequest: sock.updateMediaMessage,
+      }),
+      BAILEYS_MEDIA_DOWNLOAD_TIMEOUT_MS,
+      'downloadMediaMessage'
+    );
+
+  // Helper: intento de updateMediaMessage con timeout centralizado (soft-fail)
+  const attemptUpdate = async () => {
+    if (!canUpdate) return false;
+    try {
+      const updated = await withTimeout(
+        sock.updateMediaMessage(msgToDownload),
+        BAILEYS_MEDIA_UPDATE_TIMEOUT_MS,
+        'updateMediaMessage'
+      );
+      if (updated?.message) {
+        msgToDownload = { ...msgToDownload, message: updated.message };
+      }
+      console.log(`${label} refresh_ok dt=${Date.now() - t0}ms`);
+      return true;
+    } catch (updateErr) {
+      console.warn(`${label} refresh_failed dt=${Date.now() - t0}ms reason=${updateErr?.message}`);
+      return false;
+    }
+  };
+
+  // ── FASE 1 ───────────────────────────────────────────────────────────────────
+  // imageMessage: siempre pre-refresh antes de descargar (comportamiento anterior).
+  // Otros tipos: intentar descarga directa primero; el hook reuploadRequest maneja
+  // internamente el refresh si la URL está expirada.
+  if (type === 'imageMessage') {
+    console.log(`${label} media_expired_refresh_start reason=eager_image dt=${Date.now() - t0}ms`);
+    await attemptUpdate(); // soft-fail: si falla, igual intentamos descargar
+  }
+
+  let lastErr;
+  try {
+    const buf = await attemptDownload(msgToDownload);
+    console.log(`${label} download_success bytes=${buf?.length ?? 0} dt=${Date.now() - t0}ms attempt=1`);
+    return buf;
+  } catch (err1) {
+    lastErr = err1;
+    console.warn(`${label} download_attempt_failed attempt=1 dt=${Date.now() - t0}ms reason=${err1?.message}`);
+
+    // Rechazo del servidor WA → irrecuperable, no perder tiempo en más intentos
+    if (isWaServerRejection(err1)) {
+      console.error(`${label} media_unrecoverable reason=wa_server_rejection dt=${Date.now() - t0}ms`);
+      throw new MediaUnrecoverableError(`Media rechazado por WA servers (${type})`, err1);
+    }
+  }
+
+  // ── FASE 2 ───────────────────────────────────────────────────────────────────
+  // La descarga directa falló por error de red/timeout.
+  // Intentar refresh explícito y reintento (hasta BAILEYS_MEDIA_MAX_RETRIES veces).
+  for (let attempt = 2; attempt <= 1 + BAILEYS_MEDIA_MAX_RETRIES; attempt++) {
+    console.log(`${label} media_expired_refresh_start reason=download_failed attempt=${attempt} dt=${Date.now() - t0}ms`);
+    await attemptUpdate(); // soft-fail
+
+    console.log(`${label} download_retry attempt=${attempt} dt=${Date.now() - t0}ms`);
+    try {
+      const buf = await attemptDownload(msgToDownload);
+      console.log(`${label} download_success bytes=${buf?.length ?? 0} dt=${Date.now() - t0}ms attempt=${attempt}`);
+      return buf;
+    } catch (errN) {
+      lastErr = errN;
+      console.warn(`${label} download_attempt_failed attempt=${attempt} dt=${Date.now() - t0}ms reason=${errN?.message}`);
+
+      if (isWaServerRejection(errN)) {
+        console.error(`${label} media_unrecoverable reason=wa_server_rejection dt=${Date.now() - t0}ms`);
+        throw new MediaUnrecoverableError(`Media rechazado por WA servers (${type})`, errN);
+      }
+    }
+  }
+
+  // Todos los intentos agotados
+  console.error(`${label} media_unrecoverable reason=all_attempts_exhausted dt=${Date.now() - t0}ms`);
+  throw new MediaUnrecoverableError(`Media irrecuperable tras ${BAILEYS_MEDIA_MAX_RETRIES + 1} intentos (${type})`, lastErr);
 }
 
 // ==========================
@@ -237,15 +417,19 @@ function broadcastStatus() {
 async function startSock() {
   // Evita sockets duplicados
   try { sock?.end?.(); } catch {}
-  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  const { state, saveCreds } = await useMultiFileAuthState(BAILEYS_AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
     logger: P({ level: 'silent' }),
     auth: state,
-    printQRInTerminal: true
+    printQRInTerminal: true,
+    // En local/dev se puede desactivar la sincronización de historial completo.
+    // En prod dejar en false (no deshabilitar) para comportamiento normal.
+    syncFullHistory: !BAILEYS_DISABLE_HISTORY_SYNC,
   });
+  console.log(`[BAILEYS] socket_created env=${BAILEYS_ENV} auth_dir=${BAILEYS_AUTH_DIR} history_sync_disabled=${BAILEYS_DISABLE_HISTORY_SYNC}`);
 
   console.log('updateMediaMessage:', typeof sock.updateMediaMessage);
 
@@ -264,6 +448,7 @@ async function startSock() {
       ALERTA_ENVIADA.estado = false;
       broadcastStatus();
       console.log('✅ Conectado a WhatsApp');
+      console.log(`[BAILEYS] connected env=${BAILEYS_ENV} auth_dir=${BAILEYS_AUTH_DIR} history_sync_disabled=${BAILEYS_DISABLE_HISTORY_SYNC} ignore_stale=${BAILEYS_IGNORE_STALE_SYNC_MESSAGES} boot_ts=${BOOT_TS}`);
     }
 
     if (connection === 'close') {
@@ -295,7 +480,19 @@ async function startSock() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  // History sync: solo logging, nunca dispara lógica de negocio.
+  sock.ev.on('messaging-history.set', ({ chats, messages: histMsgs, isLatest }) => {
+    console.log(`[BAILEYS] history_sync_received chats=${chats?.length ?? 0} messages=${histMsgs?.length ?? 0} isLatest=${isLatest} — ignorado para negocio`);
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // type='notify'  → mensaje en tiempo real (procesar)
+    // type='append'  → historial sincronizado al reconectar (ignorar para negocio)
+    if (type !== 'notify') {
+      console.log(`[BAILEYS] messages_upsert_ignored reason=not_notify type=${type} count=${messages.length}`);
+      return;
+    }
+
     for (const msg of messages) {
       // Hoisted para acceso en catch (fallback UX)
       let rawJid = null;
@@ -306,12 +503,43 @@ async function startSock() {
         if (msg.key.remoteJid.endsWith('@g.us')) continue;
 
         rawJid = normalizeJid(msg.key.remoteJid);
+        const msgId = msg.key.id || 'unknown';
+        const msgTs = Number(msg.messageTimestamp) || 0;
+
+        console.log(`[BAILEYS] message_received remoteJid=${rawJid} id=${msgId} ts=${msgTs}`);
+
+        // ── Capa 1: stale filter ─────────────────────────────────────────────
+        // Mensajes cuyo timestamp es anterior al arranque de esta instancia
+        // son mensajes acumulados de otro ambiente o de cuando estábamos caídos.
+        // Solo activo si BAILEYS_IGNORE_STALE_SYNC_MESSAGES=true.
+        if (BAILEYS_IGNORE_STALE_SYNC_MESSAGES && msgTs > 0 && msgTs < BOOT_TS) {
+          console.log(`[BAILEYS] message_ignored reason=stale_pre_boot remoteJid=${rawJid} id=${msgId} msgTs=${msgTs} bootTs=${BOOT_TS}`);
+          continue;
+        }
+
+        // ── Capa 2: deduplicación persistente en Redis ───────────────────────
+        // Persiste entre reinicios y entre ambientes (local ↔ prod) si comparten Redis.
+        const dedupeKey = buildMessageDedupeKey(msg);
+        if (await wasMessageProcessed(dedupeKey)) {
+          console.log(`[BAILEYS] message_ignored reason=duplicate remoteJid=${rawJid} id=${msgId} key=${dedupeKey}`);
+          continue;
+        }
+        // Marcar ANTES de enviar al orquestador: previene duplicados concurrentes.
+        // Si el orquestador falla, el mensaje no se reintenta automáticamente.
+        // El orquestador debe implementar idempotencia propia como segunda barrera.
+        await markMessageProcessed(dedupeKey);
+
         const phone = extractPhone(rawJid);
 
         const realMessage = unwrapMessage(msg.message);
         if (!realMessage) continue;
 
-        const type = Object.keys(realMessage)[0];
+        // messageContextInfo is metadata (forwarding context, etc.) — never the actual content.
+        // When WhatsApp attaches it alongside a real message type (e.g. documentMessage),
+        // Object.keys()[0] would pick messageContextInfo and misidentify the message.
+        const _META_KEYS = new Set(['messageContextInfo', 'senderKeyDistributionMessage']);
+        const type = Object.keys(realMessage).find(k => !_META_KEYS.has(k))
+                  || Object.keys(realMessage)[0];
         mediaType = type;
         const content = realMessage[type];
         // ✅ Texto que el usuario escribió junto al archivo (caption)
@@ -335,68 +563,7 @@ async function startSock() {
         } else if (type === 'buttonsResponseMessage') {
           text = content.selectedButtonId || content.selectedDisplayText || 'CONFIRMAR';
         } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(type)) {
-          const t0 = Date.now();
-          const mediaUrl   = content?.url;
-          const directPath = content?.directPath;
-          const mediaKey   = content?.mediaKey;
-          const expired    = mediaUrl ? isUrlExpired(mediaUrl) : false;
-          const msgAgeMs   = Date.now() - Number(msg.messageTimestamp) * 1000;
-
-          console.log(`📥 media type=${type} from=${rawJid}`, {
-            url:        mediaUrl   ? 'present' : 'absent',
-            directPath: directPath ? 'present' : 'absent',
-            mediaKey:   mediaKey   ? 'present' : 'absent',
-            mimetype:   content?.mimetype,
-            expired,
-            msgAgeMs,
-          });
-
-          let msgToDownload = { ...msg, message: realMessage };
-
-          // imageMessage desde galería: siempre refrescar URL antes de descargar.
-          // El CDN puede haber purgado el contenido antes de que expire el parámetro oe.
-          // Para otros tipos: solo refrescar si expirado o sin URL.
-          const shouldRefresh = typeof sock.updateMediaMessage === 'function'
-            && (type === 'imageMessage' || expired || !mediaUrl);
-
-          if (shouldRefresh) {
-            console.log(`🔄 updateMediaMessage type=${type} t=${Date.now() - t0}ms`);
-            const t1 = Date.now();
-            try {
-              const updated = await retry(
-                () => withTimeout(sock.updateMediaMessage(msgToDownload), 15000, 'updateMediaMessage'),
-                1,
-                'updateMediaMessage'
-              );
-              if (updated?.message) msgToDownload = { ...msgToDownload, message: updated.message };
-              console.log(`✅ updateMediaMessage ok dt=${Date.now() - t1}ms`);
-            } catch (updateErr) {
-              console.warn(`⚠️ updateMediaMessage falló dt=${Date.now() - t1}ms:`, updateErr?.message);
-              if (expired || !mediaUrl) {
-                // Sin URL válida y sin refresh → no hay forma de descargar
-                throw updateErr;
-              }
-              // URL presente pero refresh falló → intentar con URL original
-              console.warn('⚠️ Intentando descarga con URL original...');
-            }
-          } else if (expired) {
-            throw new Error('Media expirado y updateMediaMessage no disponible');
-          }
-
-          console.log(`⬇️ downloadMediaMessage dt_pre=${Date.now() - t0}ms`);
-          fileBuffer = await withTimeout(
-            downloadMediaMessage(
-              msgToDownload,
-              'buffer',
-              {},
-              { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
-            ),
-            45000,
-            'downloadMediaMessage'
-          );
-
-          console.log(`✅ download ok bytes=${fileBuffer?.length ?? 0} dt_total=${Date.now() - t0}ms`);
-
+          fileBuffer = await downloadMediaRobust(sock, msg, realMessage, content, type);
           filename = content.fileName || `${type}-${Date.now()}`;
           mimetype = content.mimetype || 'application/octet-stream';
           text = `[${type}] recibido`;
@@ -448,19 +615,24 @@ async function startSock() {
       } catch (err) {
         const status = err?.response?.status;
         const url    = err?.config?.url;
-        const isMediaFail =
+
+        const isMediaUnrecoverable = err?.name === 'MediaUnrecoverableError';
+        const isMediaNetworkFail =
           (status && url && url.includes('mmg.whatsapp.net')) ||
           err?.message?.includes('Timeout') ||
-          err?.message?.includes('fetch stream') ||
-          err?.message?.includes('updateMediaMessage');
+          err?.message?.includes('fetch stream');
 
-        if (isMediaFail) {
-          console.error(`❌ Error descargando media type=${mediaType}:`, err?.message || err);
-          // Fallback UX: pedir al usuario que reenvíe como documento
-          if (rawJid && mediaType === 'imageMessage') {
+        if (isMediaUnrecoverable || isMediaNetworkFail) {
+          console.error(`[BAILEYS MEDIA] media_error type=${mediaType || 'unknown'} reason=${err?.message || err}`);
+          // Notificar al usuario para todos los tipos de media, no solo imágenes
+          if (rawJid && mediaType) {
+            const isImage = mediaType === 'imageMessage';
+            const hint = isImage
+              ? 'reenvíala como *documento* (📎 → Documento al adjuntar)'
+              : 'reenvíalo por favor';
             try {
               await sock.sendMessage(rawJid, {
-                text: '⚠️ No pude descargar tu imagen. Por favor reenvíala como *documento* (toca 📎 → Documento al adjuntar).'
+                text: `⚠️ Recibí tu archivo, pero WhatsApp ya no me permite descargarlo. ${hint}.`
               });
             } catch {}
           }
